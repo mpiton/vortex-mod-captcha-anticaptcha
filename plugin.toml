@@ -1,0 +1,12 @@
+[plugin]
+name = "vortex-mod-captcha-anticaptcha"
+version = "1.0.0"
+category = "captcha"
+author = "vortex-community"
+description = "Solves image CAPTCHAs with the AntiCaptcha paid API"
+license = "GPL-3.0"
+min_vortex_version = "0.3.0"
+repository = "https://github.com/mpiton/vortex-mod-captcha-anticaptcha"
+
+[capabilities]
+http = true

@@ -1,0 +1,142 @@
+name: Plugin CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: plugin-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Build, test, and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Verify toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version
+          rustup target list --installed | grep -qx 'wasm32-wasip1'
+
+      - name: Read package metadata
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as file:
+              cargo = tomllib.load(file)
+          with open("plugin.toml", "rb") as file:
+              manifest = tomllib.load(file)["plugin"]
+          package = cargo["package"]
+          if package["name"] != manifest["name"] or package["version"] != manifest["version"]:
+              raise SystemExit("Cargo.toml and plugin.toml metadata differ")
+          crate = cargo.get("lib", {}).get("name", package["name"].replace("-", "_"))
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"PACKAGE_NAME={package['name']}\n")
+              env.write(f"WASM_PATH=target/wasm32-wasip1/release/{crate}.wasm\n")
+              env.write(f"WASM_ASSET={package['name'].replace('-', '_')}.wasm\n")
+          PY
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint native and WASM targets
+        run: |
+          cargo clippy --locked --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+          cargo clippy --locked --lib --target wasm32-wasip1 -- -D warnings
+
+      - name: Build release WASM
+        run: cargo build --locked --lib --target wasm32-wasip1 --release
+
+      - name: Verify ABI exports
+        shell: bash
+        run: |
+          test -s "${WASM_PATH}"
+          REQUIRED_EXPORTS="can_solve solve"
+          if [[ "${PACKAGE_NAME}" == "vortex-mod-captcha-anticaptcha" ]]; then
+            REQUIRED_EXPORTS="${REQUIRED_EXPORTS} get_balance"
+          fi
+          REQUIRED_EXPORTS="${REQUIRED_EXPORTS}" node <<'JS'
+          const fs = require("node:fs");
+          const module = new WebAssembly.Module(fs.readFileSync(process.env.WASM_PATH));
+          const exports = new Set(
+            WebAssembly.Module.exports(module)
+              .filter(({ kind }) => kind === "function")
+              .map(({ name }) => name),
+          );
+          for (const name of process.env.REQUIRED_EXPORTS.split(/\s+/)) {
+            if (!exports.has(name)) throw new Error(`missing WASM export: ${name}`);
+          }
+          JS
+
+      - name: Run native and ABI smoke tests
+        run: cargo test --locked --all-targets --target x86_64-unknown-linux-gnu
+
+      - name: Build checksummed release bundle
+        run: |
+          mkdir -p dist
+          cp "${WASM_PATH}" dist/plugin.wasm
+          cp "${WASM_PATH}" "dist/${WASM_ASSET}"
+          cp plugin.toml dist/plugin.toml
+          (
+            cd dist
+            sha256sum plugin.wasm plugin.toml > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Upload verified bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plugin-release-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish immutable release
+    if: startsWith(github.ref, 'refs/tags/v') && github.actor == github.repository_owner
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: plugin-release-${{ github.sha }}
+          path: dist
+
+      - name: Verify tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+          )
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("dist/plugin.toml", "rb"))["plugin"]["version"])')"
+          test "${RELEASE_TAG}" = "v${version}"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "release already exists; refusing to mutate it"
+            exit 1
+          fi
+          gh release create "${RELEASE_TAG}" dist/*.wasm dist/plugin.toml dist/SHA256SUMS --verify-tag --generate-notes --title "${RELEASE_TAG}"
